@@ -6,6 +6,9 @@
 
 const String LOG_TAG = F("MQTTPlugin");
 
+const int DISCOVERY_FREQUENCY_SEC = 60;
+const int STATE_FREQUENCY_SEC = 5;
+
 bool MQTTPlugin::connect(Controller *controller) {
     const Settings settings = controller->getSettings();
     const String ip = settings.getHomeAssistantIP();
@@ -119,6 +122,7 @@ void MQTTPlugin::publish(const std::string &topic, const std::string &message) {
     ESP_LOGD(LOG_TAG.c_str(), "Publishing %s: %s", publishTopic, message.c_str());
     client.publish(publishTopic, message.c_str());
 }
+
 void MQTTPlugin::publishBrewState(const char *state) {
     char json[100];
     std::time_t now = std::time(nullptr); // Get current timestame
@@ -127,59 +131,107 @@ void MQTTPlugin::publishBrewState(const char *state) {
 }
 
 void MQTTPlugin::setup(Controller *controller, PluginManager *pluginManager) {
+    this->controller = controller;
     pluginManager->on("controller:wifi:connect", [this, controller](const Event &) {
-        if (!connect(controller))
-            return;
-        publishDiscovery(controller);
+        this->hasWifi = true;
+    });
+    pluginManager->on("controller:wifi:disconnect", [this, controller](const Event &) {
+        this->hasWifi = false;
     });
 
     pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
-        if (!client.connected())
-            return;
-        char json[50];
-        const float temp = event.getFloat("value");
-        if (temp != lastTemperature) {
-            snprintf(json, sizeof(json), R"***({"temperature":%02f})***", temp);
-            publish("boilers/0/temperature", json);
-        }
-        lastTemperature = temp;
+        this->currentTemperature = event.getFloat("value");
     });
     pluginManager->on("boiler:targetTemperature:change", [this](Event const &event) {
-        if (!client.connected())
-            return;
-        char json[50];
-        const float temp = event.getFloat("value");
-        snprintf(json, sizeof(json), R"***({"temperature":%02f})***", temp);
-        publish("boilers/0/targetTemperature", json);
+        this->targetTemperature = event.getFloat("value");
     });
     pluginManager->on("controller:mode:change", [this](Event const &event) {
-        int newMode = event.getInt("value");
-        const char *modeStr;
-        switch (newMode) {
-        case 0:
-            modeStr = "Standby";
-            break;
-        case 1:
-            modeStr = "Brew";
-            break;
-        case 2:
-            modeStr = "Steam";
-            break;
-        case 3:
-            modeStr = "Water";
-            break;
-        case 4:
-            modeStr = "Grind";
-            break;
-        default:
-            modeStr = "Unknown";
-            break; // Fallback in case of unexpected value
-        }
-        char json[100];
-        snprintf(json, sizeof(json), R"({"mode":%d,"mode_str":"%s"})", newMode, modeStr);
-        publish("controller/mode", json);
+        this->mode = event.getInt("value");
     });
-    pluginManager->on("controller:brew:start", [this](Event const &) { publishBrewState("brewing"); });
+    pluginManager->on("controller:brew:start", [this](Event const &) {
+        this->brewing = true;
+    });
+    pluginManager->on("controller:brew:end", [this](Event const &) {
+        this->brewing = false;
+    });
+}
 
-    pluginManager->on("controller:brew:end", [this](Event const &) { publishBrewState("not brewing"); });
+void MQTTPlugin::loop() {
+    client.loop();
+
+    if (!hasWifi) {
+      return;
+    }
+
+    std::time_t now = std::time(nullptr); // Get current timestamp
+
+    bool updateDiscovery = false;
+    if (now - lastDiscoveryTime >= DISCOVERY_FREQUENCY_SEC) {
+        updateDiscovery = true;
+        lastDiscoveryTime = now;
+    }
+
+    bool updateState = false;
+    if (now - lastStateTime >= STATE_FREQUENCY_SEC) {
+        updateState = true;
+        lastStateTime = now;
+    }
+
+    if (!updateDiscovery && !updateState) {
+        return;
+    }
+
+    // If the client has lost connection, reconnect.
+    if (!client.connected()) {
+        if (!connect(controller)) {
+            return;
+        }
+    }
+
+    if (updateDiscovery) {
+        publishDiscovery(controller);
+    }
+    if (updateState) {
+        if (currentTemperature.has_value()) {
+            char json[50];
+            snprintf(json, sizeof(json), R"***({"temperature":%02f})***", *currentTemperature);
+            publish("boilers/0/temperature", json);
+        }
+        if (targetTemperature.has_value()) {
+            char json[50];
+            snprintf(json, sizeof(json), R"***({"temperature":%02f})***", *targetTemperature);
+            publish("boilers/0/targetTemperature", json);
+        }
+        if (mode.has_value()) {
+            const char *modeStr;
+            switch (*mode) {
+            case 0:
+                modeStr = "Standby";
+                break;
+            case 1:
+                modeStr = "Brew";
+                break;
+            case 2:
+                modeStr = "Steam";
+                break;
+            case 3:
+                modeStr = "Water";
+                break;
+            case 4:
+                modeStr = "Grind";
+                break;
+            default:
+                modeStr = "Unknown";
+                break; // Fallback in case of unexpected value
+            }
+            char json[100];
+            snprintf(json, sizeof(json), R"({"mode":%d,"mode_str":"%s"})", *mode, modeStr);
+            publish("controller/mode", json);
+        }
+        if (brewing.has_value()) {
+            char json[100];
+            snprintf(json, sizeof(json), R"({"state":"%s","timestamp":%ld})", *brewing ? "brewing" : "not brewing", now);
+            publish("controller/brew/state", json);
+        }
+    }
 }
