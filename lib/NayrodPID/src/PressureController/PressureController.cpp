@@ -1,5 +1,6 @@
 #include "PressureController.h"
 #include "SimpleKalmanFilter/SimpleKalmanFilter.h"
+#include <Arduino.h> // ESP_LOGI (reset())
 #include <algorithm>
 #include <math.h>
 
@@ -78,8 +79,11 @@ void PressureController::update(ControlMode mode) {
 }
 
 float PressureController::pumpFlowModel(float alpha) const {
-    const float availableFlow = getAvailableFlow();
-    return availableFlow * alpha / 100.0f;
+    // Positive-displacement model: net = duty * Q_geo - slip (affine in duty).
+    // With slip = 0 this reduces to the previous proportional model.
+    const float duty = alpha / 100.0f;
+    const float slip = getSlip();
+    return std::max(0.0f, duty * getGeometricFlow() - slip);
 }
 
 float PressureController::getAvailableFlow() const {
@@ -92,12 +96,28 @@ float PressureController::getAvailableFlow() const {
     return Q;
 }
 
+float PressureController::getSlip() const {
+    const float P = _filteredPressureSensor;
+    const float P2 = P * P;
+    const float P3 = P2 * P;
+    const float slip =
+        _pumpSlipCoefficients[0] * P3 + _pumpSlipCoefficients[1] * P2 + _pumpSlipCoefficients[2] * P + _pumpSlipCoefficients[3];
+    return std::max(0.0f, slip); // leakage is never negative
+}
+
+// Full-drive curve is the duty=1 slice (Q_geo - slip), so Q_geo = full-drive + slip.
+float PressureController::getGeometricFlow() const { return getAvailableFlow() + getSlip(); }
+
 float PressureController::getPumpDutyCycleForFlowRate() const {
-    const float availableFlow = getAvailableFlow();
-    if (availableFlow <= 0.0f) {
+    if (*_rawFlowSetpoint <= 0.0f) {
         return 0.0f;
     }
-    float duty = (*_rawFlowSetpoint / availableFlow) * 100.0f;
+    const float geometricFlow = getGeometricFlow();
+    if (geometricFlow <= 0.0f) {
+        return 0.0f;
+    }
+    // Feedforward duty to hit the target flow, accounting for slip (incl. Q_t = 0 hold duty).
+    float duty = ((*_rawFlowSetpoint + getSlip()) / geometricFlow) * 100.0f;
     return std::clamp(duty, 0.0f, 100.0f);
 }
 
@@ -116,6 +136,19 @@ void PressureController::setPumpFlowPolyCoeffs(float a, float b, float c, float 
     _pumpFlowCoefficients[3] = d;
 }
 
+void PressureController::setPumpSlipPolyCoeffs(float a, float b, float c, float d) {
+    _pumpSlipCoefficients[0] = a;
+    _pumpSlipCoefficients[1] = b;
+    _pumpSlipCoefficients[2] = c;
+    _pumpSlipCoefficients[3] = d;
+}
+
+void PressureController::setGains(float commutationGain, float convergenceGain, float integralGain) {
+    _commutationGain = commutationGain;
+    _convergenceGain = convergenceGain;
+    _integralGain = integralGain;
+}
+
 void PressureController::tare() {
     _coffeeOutput = 0.0f;
     _pumpVolume = 0.0f;
@@ -125,6 +158,13 @@ void PressureController::tare() {
     _puckState[2] = false;
     _puckCounter = 0;
     _pumpFlowRate = 0.0f;
+    // IIR-filtered accumulators: unreset, these carry a shot's end-of-brew
+    // depressurization transient into the next shot's puck-conductance-
+    // derivative arming signature, suppressing arming — GH #839.
+    _filteredPressureDerivative = 0.0f;
+    _waterThroughPuckFlowRate = 0.0f;
+    _lastPuckConductance = 0.0f;
+    _puckConductance = 0.0f;
     _puckConductanceDerivative = 0.0f;
     _coffeeFlowRate = 0.0f;
     _puckResistance = INFINITY;
@@ -241,14 +281,21 @@ float PressureController::getPumpDutyCycleForPressure() {
     }
 
     // Integrator
-    float Ki = _integralGain / (1 - P / _maxPressure);
+    float pressureRatio = 0;
+    if (P < _maxPressure) {
+        pressureRatio = P / _maxPressure;
+    }
+    float denominator = fmaxf(1.0f - pressureRatio, 0.0001f); // Clamp to minimum 0.0001
+    float Ki = _integralGain / denominator;
     _errorIntegral += error * _dt;
     float iterm = Ki * _errorIntegral;
 
-    float Qa = getAvailableFlow();
+    // Plant-gain inversion: Qa is the duty->flow slope (d Q_in / d duty), which is the
+    // geometric flow Q_geo under the affine model. Reduces to the full-drive curve when slip = 0.
+    float Qa = getGeometricFlow();
     Qa = fmaxf(Qa, 1e-3f);
     float Ceq = _systemCompliance;
-    float K = _commutationGain / (1 - P / _maxPressure) * Qa / Ceq;
+    float K = _commutationGain / denominator * Qa / Ceq;
     _pumpDutyCycle = Ceq / Qa * (-_convergenceGain * error - K * sat_s) - iterm;
 
     // Anti-windup

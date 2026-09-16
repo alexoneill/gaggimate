@@ -1,13 +1,14 @@
 #include "ShotHistoryPlugin.h"
 
+#include <LittleFS.h>
 #include <SD_MMC.h>
-#include <SPIFFS.h>
 #include <cmath>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
+#include <display/util/PsramAllocator.h>
 
 namespace {
 constexpr float TEMP_SCALE = 10.0f;
@@ -22,6 +23,13 @@ constexpr uint16_t WEIGHT_MAX_VALUE = 10000; // 1000.0 g
 constexpr uint16_t RESISTANCE_MAX_VALUE = 0xFFFF;
 constexpr int16_t FLOW_MIN_VALUE = -2000; // -20.00 ml/s
 constexpr int16_t FLOW_MAX_VALUE = 2000;  //  20.00 ml/s
+
+// Largest believable change in scale weight within one sample interval. A real
+// espresso never adds >5 g in 250 ms (that is already 20 ml/s, the saturation
+// point of the vf field); anything larger is a scale/BLE glitch and must not be
+// folded into the flow EMA, where a single bad reading would otherwise pin vf at
+// the ±20 floor for seconds while the EMA bleeds off. See GM-110.
+constexpr float MAX_PLAUSIBLE_WEIGHT_DELTA = 5.0f; // grams per sample
 
 uint16_t encodeUnsigned(float value, float scale, uint16_t maxValue) {
     if (!std::isfinite(value)) {
@@ -76,7 +84,6 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
         fs = &SD_MMC;
         ESP_LOGI("ShotHistoryPlugin", "Logging shot history to SD card");
     }
-    rebuildIndex();
     pm->on("controller:brew:start", [this](Event const &) { startRecording(); });
     pm->on("controller:brew:end", [this](Event const &) { endRecording(); });
     pm->on("controller:brew:clear", [this](Event const &) { endExtendedRecording(); });
@@ -86,6 +93,12 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
     pm->on("boiler:currentTemperature:change", [this](Event const &event) { currentTemperature = event.getFloat("value"); });
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
+    // Initialize rebuild state
+    rebuildInProgress = false;
+    // Leftover from the abandoned separate recent-shots index; aggregates now live in index.bin.
+    if (fs->exists("/h/recent.bin")) {
+        fs->remove("/h/recent.bin");
+    }
     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
 }
 
@@ -115,18 +128,30 @@ void ShotHistoryPlugin::record() {
                 strncpy(header.profileName, profile.label.c_str(), sizeof(header.profileName) - 1);
                 header.profileName[sizeof(header.profileName) - 1] = '\0';
                 header.phaseTransitionCount = 0; // Initialize phase transition count
+                // Brew delay (ms) the shot ran with; round and clamp into the uint16_t field
+                double delayMs = currentBrewDelay > 0.0 ? currentBrewDelay + 0.5 : 0.0;
+                header.brewDelayMs = delayMs > 65535.0 ? 65535 : static_cast<uint16_t>(delayMs);
                 // Write header placeholder
                 currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
             }
         }
-        float btDiff = currentBluetoothWeight - lastBluetoothWeight;
-        float btFlow = btDiff / 0.25f;
-        currentBluetoothFlow = currentBluetoothFlow * 0.75f + btFlow * 0.25f;
-        lastBluetoothWeight = currentBluetoothWeight;
+        // Bluetooth weight flow (vf): derive from the same non-negative weight we
+        // store in sample.v so the two can never disagree, and skip the EMA update
+        // on an implausible single-sample jump so one bad scale/BLE reading cannot
+        // saturate vf for seconds. See GM-110.
+        const float btWeight = currentBluetoothWeight > 0.0f ? currentBluetoothWeight : 0.0f;
+        const float btDiff = btWeight - lastBluetoothWeight;
+        if (fabsf(btDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
+            const float btFlow = btDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
+            currentBluetoothFlow = currentBluetoothFlow * 0.75f + btFlow * 0.25f;
+        }
+        lastBluetoothWeight = btWeight;
 
         ShotLogSample sample{};
-        uint32_t tick = sampleCount <= 0xFFFF ? sampleCount : 0xFFFF;
-        sample.t = static_cast<uint16_t>(tick);
+        // Capture when this sampling pass actually runs. Older formats inferred
+        // time from sampleCount, which compressed the chart whenever task/SD
+        // overhead made the nominal 250 ms loop run late.
+        sample.t = millis() - shotStart;
         sample.tt = encodeUnsigned(controller->getTargetTemp(), TEMP_SCALE, TEMP_MAX_VALUE);
         sample.ct = encodeUnsigned(currentTemperature, TEMP_SCALE, TEMP_MAX_VALUE);
         sample.tp = encodeUnsigned(controller->getTargetPressure(), PRESSURE_SCALE, PRESSURE_MAX_VALUE);
@@ -135,13 +160,16 @@ void ShotHistoryPlugin::record() {
         sample.tf = encodeSigned(controller->getTargetFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.pf = encodeSigned(controller->getCurrentPuckFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.vf = encodeSigned(currentBluetoothFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.v = encodeUnsigned(currentBluetoothWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+        sample.v = encodeUnsigned(btWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.ev = encodeUnsigned(currentEstimatedWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
         sample.si = getSystemInfo(); // Pack system state information
+        sample.wp = encodeUnsigned(controller->getCurrentWaterPumped(), WEIGHT_SCALE, WEIGHT_MAX_VALUE);
 
         // Track phase transitions
         if (controller->getMode() == MODE_BREW) {
+            // Deref under the process lock — other tasks delete the process at any time (GM-147).
+            std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
             Process *process = controller->getProcess();
             if (process != nullptr && process->getType() == MODE_BREW) {
                 auto *brewProcess = static_cast<BrewProcess *>(process);
@@ -149,7 +177,7 @@ void ShotHistoryPlugin::record() {
 
                 // Check for phase transition
                 if (currentPhase != lastRecordedPhase) {
-                    recordPhaseTransition(currentPhase, sampleCount);
+                    recordPhaseTransition(currentPhase, sampleCount, static_cast<uint8_t>(brewProcess->lastExitReason));
                     lastRecordedPhase = currentPhase;
                 }
             }
@@ -162,12 +190,17 @@ void ShotHistoryPlugin::record() {
             memcpy(ioBuffer + ioBufferPos, &sample, sizeof(sample));
             ioBufferPos += sizeof(sample);
             sampleCount++;
-        }
 
-        // Check for early index insertion (once per shot after 7.5s)
-        if (!indexEntryCreated && (millis() - shotStart) > 7500) {
-            createEarlyIndexEntry();
-            indexEntryCreated = true;
+            // Track running aggregates for the rolling recent-shots buffer.
+            tempSumScaled += sample.ct;
+            tempSampleCount++;
+            if (sample.cp > maxPressureScaled) {
+                maxPressureScaled = sample.cp;
+            }
+            if (sample.fl > 0) {
+                flowSumScaled += sample.fl;
+                positiveFlowCount++;
+            }
         }
 
         // Check for weight stabilization during extended recording
@@ -212,6 +245,7 @@ void ShotHistoryPlugin::record() {
         // Patch header with sampleCount and duration
         header.sampleCount = sampleCount;
         header.durationMs = millis() - shotStart;
+        header.finalExitReason = finalExitReason; // why the shot ended (last phase exit or manual abort)
         float finalWeight = currentBluetoothWeight;
         header.finalWeight = finalWeight > 0.0f ? encodeUnsigned(finalWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE) : 0;
         currentFile.seek(0, SeekSet);
@@ -221,44 +255,61 @@ void ShotHistoryPlugin::record() {
         unsigned long duration = header.durationMs;
         if (duration <= 7500) { // Exclude failed shots and flushes
             fs->remove("/h/" + currentId + ".slog");
-
-            // If we created an early index entry, mark it as deleted
-            if (indexEntryCreated) {
-                markIndexDeleted(currentId.toInt());
-            }
         } else {
             controller->getSettings().setHistoryIndex(controller->getSettings().getHistoryIndex() + 1);
             cleanupHistory();
 
-            if (indexEntryCreated) {
-                // Update existing entry with final completion data
-                updateIndexCompletion(currentId.toInt(), header);
-            } else {
-                // Create completed entry directly (edge case: shot ended right after 7.5s)
-                ShotIndexEntry indexEntry{};
-                indexEntry.id = currentId.toInt();
-                indexEntry.timestamp = header.startEpoch;
-                indexEntry.duration = header.durationMs;
-                indexEntry.volume = header.finalWeight;
-                indexEntry.rating = 0; // Will be updated if notes are added
-                indexEntry.flags = SHOT_FLAG_COMPLETED;
-                strncpy(indexEntry.profileId, header.profileId, sizeof(indexEntry.profileId) - 1);
-                indexEntry.profileId[sizeof(indexEntry.profileId) - 1] = '\0';
-                strncpy(indexEntry.profileName, header.profileName, sizeof(indexEntry.profileName) - 1);
-                indexEntry.profileName[sizeof(indexEntry.profileName) - 1] = '\0';
+            // Always create a complete index entry via upsert.
+            // If an early entry exists, it gets overwritten with final data.
+            // If no early entry exists, a new one is appended.
+            ShotIndexEntry indexEntry{};
+            indexEntry.id = currentId.toInt();
+            indexEntry.timestamp = header.startEpoch;
+            indexEntry.duration = header.durationMs;
+            indexEntry.volume = header.finalWeight;
+            indexEntry.rating = 0;
+            indexEntry.flags = SHOT_FLAG_COMPLETED;
+            strncpy(indexEntry.profileId, header.profileId, sizeof(indexEntry.profileId) - 1);
+            indexEntry.profileId[sizeof(indexEntry.profileId) - 1] = '\0';
+            strncpy(indexEntry.profileName, header.profileName, sizeof(indexEntry.profileName) - 1);
+            indexEntry.profileName[sizeof(indexEntry.profileName) - 1] = '\0';
+            indexEntry.avgTemp = tempSampleCount ? static_cast<uint16_t>(tempSumScaled / tempSampleCount) : 0;
+            indexEntry.maxPressure = maxPressureScaled;
+            indexEntry.avgFlow = positiveFlowCount ? static_cast<uint16_t>(flowSumScaled / positiveFlowCount) : 0;
 
-                appendToIndex(indexEntry);
+            if (!appendToIndex(indexEntry)) {
+                ESP_LOGE("ShotHistoryPlugin", "CRITICAL: Failed to add completed shot %u to index", indexEntry.id);
+            }
+
+            // Notify clients the shot is actually persisted. The brew process's
+            // isActive/isFinished state (used elsewhere for UI) can go inactive
+            // well before extended recording (BLE scale weight settling, see
+            // endRecording()) finishes writing this entry, so the dashboard
+            // listens for this event instead of inferring timing from that state.
+            if (pluginManager) {
+                Event savedEvent;
+                savedEvent.id = "evt:history-shot-saved";
+                savedEvent.setInt("id", indexEntry.id);
+                pluginManager->trigger(savedEvent);
             }
         }
     }
 }
 
 void ShotHistoryPlugin::startRecording() {
-    Process *process = controller->getProcess();
-    if (process->getType() == MODE_BREW) {
-        BrewProcess *brewProcess = static_cast<BrewProcess *>(process);
-        if (brewProcess->isUtility()) {
-            return;
+    {
+        // Deref under the process lock — other tasks delete the process at any time (GM-147).
+        std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+        Process *process = controller->getProcess();
+        if (process != nullptr && process->getType() == MODE_BREW) {
+            BrewProcess *brewProcess = static_cast<BrewProcess *>(process);
+            if (brewProcess->isUtility()) {
+                return;
+            }
+            // Capture initial volumetric mode state (brew by weight vs brew by time)
+            shotStartedVolumetric = brewProcess->target == ProcessTarget::VOLUMETRIC;
+            // Capture the brew delay the shot runs with (fixed at process construction)
+            currentBrewDelay = brewProcess->brewDelay;
         }
     }
     currentId = padId(String(controller->getSettings().getHistoryIndex()));
@@ -269,18 +320,21 @@ void ShotHistoryPlugin::startRecording() {
     lastStableWeight = 0.0f;
     currentEstimatedWeight = 0.0f;
     currentBluetoothFlow = 0.0f;
+    lastBluetoothWeight = 0.0f;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
     recording = true;
     extendedRecording = false;
-    indexEntryCreated = false; // Reset flag for new shot
     sampleCount = 0;
     ioBufferPos = 0;
+    tempSumScaled = 0;
+    tempSampleCount = 0;
+    maxPressureScaled = 0;
+    flowSumScaled = 0;
+    positiveFlowCount = 0;
 
     // Reset phase tracking for new shot
-    lastRecordedPhase = 0xFF; // Invalid value to detect first phase
-
-    // Capture initial volumetric mode state (brew by weight vs brew by time)
-    shotStartedVolumetric = controller->getSettings().isVolumetricTarget();
+    lastRecordedPhase = 0xFF;                                      // Invalid value to detect first phase
+    finalExitReason = static_cast<uint8_t>(PhaseExitReason::NONE); // Reset shot-end reason
 }
 
 unsigned long ShotHistoryPlugin::getTime() {
@@ -290,12 +344,41 @@ unsigned long ShotHistoryPlugin::getTime() {
 }
 
 void ShotHistoryPlugin::endRecording() {
+    // Capture how the shot ended: if the process ran to completion, reuse the last phase's exit reason;
+    // if it was still running when stopped, the user aborted it. getLastProcess() is the just-ended brew
+    // process here (deactivate() moves currentProcess -> lastProcess before firing controller:brew:end).
+    if (controller != nullptr) {
+        // Deref under the process lock — other tasks delete the process at any time (GM-147).
+        std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+        Process *last = controller->getLastProcess();
+        if (last != nullptr && last->getType() == MODE_BREW) {
+            auto *brewProcess = static_cast<BrewProcess *>(last);
+            PhaseExitReason reason =
+                brewProcess->processPhase == ProcessPhase::FINISHED ? brewProcess->lastExitReason : PhaseExitReason::ABORTED;
+            finalExitReason = static_cast<uint8_t>(reason);
+        }
+    }
+
     if (recording && controller && controller->isVolumetricAvailable() && currentBluetoothWeight > 0) {
         // Start extended recording for any shot with active weight data
         extendedRecording = true;
         extendedRecordingStart = millis();
         lastStableWeight = currentBluetoothWeight;
         lastWeightChangeTime = 0;
+    }
+
+    // Notify clients immediately, without waiting for the history file write
+    // (which can lag behind by the extended-recording window above). Pressure
+    // and flow are already final at this point: the pump is off, so any
+    // further samples recorded during extended recording have cp/fl at or
+    // near zero and cannot change the running max/average.
+    if (pluginManager) {
+        Event statsEvent;
+        statsEvent.id = "evt:shot-finished-stats";
+        statsEvent.setFloat("maxPressure", maxPressureScaled > 0 ? maxPressureScaled / PRESSURE_SCALE : 0.0f);
+        statsEvent.setFloat("avgFlow",
+                            positiveFlowCount > 0 ? (flowSumScaled / static_cast<float>(positiveFlowCount)) / FLOW_SCALE : 0.0f);
+        pluginManager->trigger(statsEvent);
     }
 
     recording = false;
@@ -307,7 +390,7 @@ void ShotHistoryPlugin::endExtendedRecording() {
     }
 }
 
-void ShotHistoryPlugin::recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex) {
+void ShotHistoryPlugin::recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex, uint8_t reason) {
     // Only record if we have space and a valid header
     if (header.phaseTransitionCount >= 12 || !isFileOpen) {
         return;
@@ -319,7 +402,7 @@ void ShotHistoryPlugin::recordPhaseTransition(uint8_t phaseNumber, uint16_t samp
 
     transition.sampleIndex = sampleIndex;
     transition.phaseNumber = phaseNumber;
-    transition.reserved = 0;
+    transition.transitionReason = reason; // PhaseExitReason for why the previous phase ended
 
     // Get phase name from profile
     if (phaseNumber < profile.phases.size()) {
@@ -346,6 +429,8 @@ uint16_t ShotHistoryPlugin::getSystemInfo() {
 
     // Bit 1: Currently in volumetric mode (check current process if active)
     if (controller != nullptr) {
+        // Deref under the process lock — other tasks delete the process at any time (GM-147).
+        std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
         Process *process = controller->getProcess();
         if (process != nullptr && process->getType() == MODE_BREW) {
             auto *brewProcess = static_cast<BrewProcess *>(process);
@@ -376,20 +461,63 @@ uint16_t ShotHistoryPlugin::getSystemInfo() {
 }
 
 void ShotHistoryPlugin::cleanupHistory() {
+    size_t freeSpace = getFreeSpace();
+    if (freeSpace > MIN_FREE_SPACE_BYTES) {
+        return; // Enough space, nothing to do
+    }
+
+    // Collect and sort .slog files to find the oldest
     File directory = fs->open("/h");
-    std::vector<String> entries;
+    std::vector<String> slogFiles;
     String filename = directory.getNextFileName();
     while (filename != "") {
-        entries.push_back(filename);
+        if (filename.endsWith(".slog")) {
+            slogFiles.push_back(filename);
+        }
         filename = directory.getNextFileName();
     }
-    sort(entries.begin(), entries.end(), [](String a, String b) { return a < b; });
-    if (entries.size() > MAX_HISTORY_ENTRIES) {
-        for (unsigned int i = 0; i < entries.size() - MAX_HISTORY_ENTRIES; i++) {
-            String name = entries[i];
-            fs->remove(name);
-        }
+    directory.close();
+
+    if (slogFiles.empty()) {
+        return;
     }
+
+    sort(slogFiles.begin(), slogFiles.end(), [](const String &a, const String &b) { return a < b; });
+
+    // Remove oldest files one at a time until we have enough free space
+    size_t removed = 0;
+    for (size_t i = 0; i < slogFiles.size() && getFreeSpace() <= MIN_FREE_SPACE_BYTES; i++) {
+        String fname = slogFiles[i];
+        int start = fname.lastIndexOf('/') + 1;
+        int end = fname.lastIndexOf('.');
+        if (end > start) {
+            uint32_t shotId = fname.substring(start, end).toInt();
+            markIndexDeleted(shotId);
+        }
+
+        // Remove .slog and associated .json notes file
+        fs->remove(fname);
+        String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
+        fs->remove(notesPath);
+        removed++;
+    }
+
+    if (removed > 0) {
+        ESP_LOGI("ShotHistoryPlugin", "Cleaned up %u old shots (free space: %u bytes)", removed, getFreeSpace());
+    }
+}
+
+size_t ShotHistoryPlugin::getFreeSpace() {
+    if (controller->isSDCard()) {
+        uint64_t total = SD_MMC.totalBytes();
+        uint64_t used = SD_MMC.usedBytes();
+        uint64_t free = total > used ? (total - used) : 0;
+        // Cap to size_t max for consistency
+        return free > SIZE_MAX ? SIZE_MAX : static_cast<size_t>(free);
+    }
+    size_t total = LittleFS.totalBytes();
+    size_t used = LittleFS.usedBytes();
+    return total > used ? (total - used) : 0;
 }
 
 void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &response) {
@@ -397,47 +525,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
     response["tp"] = String("res:") + type.substring(4);
     response["rid"] = request["rid"].as<String>();
 
-    if (type == "req:history:list") {
-        JsonArray arr = response["history"].to<JsonArray>();
-        File root = fs->open("/h");
-        if (root && root.isDirectory()) {
-            File file = root.openNextFile();
-            while (file) {
-                String fname = String(file.name());
-                if (fname.endsWith(".slog")) {
-                    // Read header only
-                    ShotLogHeader hdr{};
-                    if (file.read(reinterpret_cast<uint8_t *>(&hdr), sizeof(hdr)) == sizeof(hdr) && hdr.magic == SHOT_LOG_MAGIC) {
-                        float finalWeight = hdr.finalWeight > 0 ? static_cast<float>(hdr.finalWeight) / WEIGHT_SCALE : 0.0f;
-
-                        bool headerIncomplete = hdr.sampleCount == 0;
-
-                        auto o = arr.add<JsonObject>();
-                        int start = fname.lastIndexOf('/') + 1;
-                        int end = fname.lastIndexOf('.');
-                        String id = fname.substring(start, end);
-                        o["id"] = id;
-                        o["version"] = hdr.version;
-                        o["timestamp"] = hdr.startEpoch;
-                        o["profile"] = hdr.profileName;
-                        o["profileId"] = hdr.profileId;
-                        o["samples"] = hdr.sampleCount;
-                        o["duration"] = hdr.durationMs;
-                        if (finalWeight > 0.0f) {
-                            o["volume"] = finalWeight;
-                        }
-                        if (headerIncomplete) {
-                            o["incomplete"] = true; // flag partial shot
-                        }
-                    }
-                }
-                file = root.openNextFile();
-            }
-        }
-    } else if (type == "req:history:get") {
-        // Return error: binary must be fetched via HTTP endpoint
-        response["error"] = "use HTTP /api/history?id=<id>";
-    } else if (type == "req:history:delete") {
+    if (type == "req:history:delete") {
         auto id = request["id"].as<String>();
         String paddedId = id;
         while (paddedId.length() < 6) {
@@ -452,12 +540,13 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         response["msg"] = "Ok";
     } else if (type == "req:history:notes:get") {
         auto id = request["id"].as<String>();
-        JsonDocument notes;
+        JsonDocument notes(&psramAllocator);
         loadNotes(id, notes);
         response["notes"] = notes;
     } else if (type == "req:history:notes:save") {
         auto id = request["id"].as<String>();
-        auto notes = request["notes"];
+        JsonDocument notes; // explicit document: variant->const JsonDocument& is ambiguous on clang
+        notes.set(request["notes"]);
         saveNotes(id, notes);
 
         // Update rating and volume in index
@@ -477,8 +566,9 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
 
         response["msg"] = "Ok";
     } else if (type == "req:history:rebuild") {
-        rebuildIndex();
-        response["msg"] = "Index rebuilt";
+        // Rebuild is now handled asynchronously by WebUIPlugin
+        // This path shouldn't be reached, but handle it just in case
+        response["msg"] = "Use async rebuild";
     }
 }
 
@@ -503,10 +593,24 @@ void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
 
 void ShotHistoryPlugin::loopTask(void *arg) {
     auto *plugin = static_cast<ShotHistoryPlugin *>(arg);
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t interval = pdMS_TO_TICKS(SHOT_LOG_SAMPLE_INTERVAL_MS);
     while (true) {
         plugin->record();
-        // Use canonical interval from shot log format to avoid divergence.
-        vTaskDelay(SHOT_LOG_SAMPLE_INTERVAL_MS / portTICK_PERIOD_MS);
+
+        // If record() ran past the next deadline, the measurements that should
+        // have occurred during that gap cannot be recovered. Rebase the cadence
+        // from now instead of running immediate catch-up passes with nearly
+        // identical capture times. The v6 timestamps preserve the visible gap.
+        const TickType_t now = xTaskGetTickCount();
+        const TickType_t nextDeadline = lastWakeTime + interval;
+        if (static_cast<int32_t>(now - nextDeadline) >= 0) {
+            lastWakeTime = now;
+        }
+
+        // Keep the cadence tied to an absolute schedule so time spent in
+        // record() does not accumulate into every subsequent interval.
+        vTaskDelayUntil(&lastWakeTime, interval);
     }
 }
 
@@ -520,7 +624,19 @@ void ShotHistoryPlugin::flushBuffer() {
 // Index management methods
 bool ShotHistoryPlugin::ensureIndexExists() {
     if (fs->exists("/h/index.bin")) {
-        return true;
+        // Validate existing index header
+        File indexFile = fs->open("/h/index.bin", "r");
+        if (indexFile) {
+            ShotIndexHeader hdr{};
+            bool valid =
+                (indexFile.read(reinterpret_cast<uint8_t *>(&hdr), sizeof(hdr)) == sizeof(hdr) && hdr.magic == SHOT_INDEX_MAGIC);
+            indexFile.close();
+            if (valid) {
+                return true;
+            }
+            ESP_LOGW("ShotHistoryPlugin", "Corrupt index file detected (bad magic), recreating");
+            fs->remove("/h/index.bin");
+        }
     }
 
     // Create new empty index
@@ -544,35 +660,44 @@ bool ShotHistoryPlugin::ensureIndexExists() {
     return true;
 }
 
-void ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
+bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     if (!ensureIndexExists()) {
-        return;
+        return false;
     }
 
     File indexFile = fs->open("/h/index.bin", "r+");
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for append");
-        return;
+        return false;
     }
 
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
         indexFile.close();
-        return;
+        return false;
     }
 
-    // Check for existing entry with same ID to prevent duplicates
+    // Check for existing entry with same ID - update in place (upsert)
     int existingPos = findEntryPosition(indexFile, header, entry.id);
     if (existingPos >= 0) {
-        ESP_LOGW("ShotHistoryPlugin", "Attempt to add duplicate entry for shot %u - entry already exists at position %d",
-                 entry.id, existingPos);
+        if (writeEntryAtPosition(indexFile, existingPos, entry)) {
+            ESP_LOGD("ShotHistoryPlugin", "Updated existing index entry for shot %u", entry.id);
+            indexFile.close();
+            return true;
+        }
+        ESP_LOGE("ShotHistoryPlugin", "Failed to update existing index entry for shot %u", entry.id);
         indexFile.close();
-        return;
+        return false;
     }
 
     // Append entry
     indexFile.seek(0, SeekEnd);
-    indexFile.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
+    size_t written = indexFile.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
+    if (written != sizeof(entry)) {
+        ESP_LOGE("ShotHistoryPlugin", "Failed to write index entry for shot %u", entry.id);
+        indexFile.close();
+        return false;
+    }
 
     // Update header
     header.entryCount++;
@@ -582,6 +707,7 @@ void ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
 
     indexFile.close();
     ESP_LOGD("ShotHistoryPlugin", "Appended shot %u to index", entry.id);
+    return true;
 }
 
 void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume) {
@@ -662,8 +788,73 @@ void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
     indexFile.close();
 }
 
+size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t maxCount) {
+    File indexFile = fs->open("/h/index.bin", "r");
+    if (!indexFile) {
+        return 0;
+    }
+
+    ShotIndexHeader header{};
+    if (!readIndexHeader(indexFile, header)) {
+        indexFile.close();
+        return 0;
+    }
+
+    // Entries are appended in id order, so walking backwards yields newest first.
+    size_t found = 0;
+    for (uint32_t i = header.entryCount; i > 0 && found < maxCount; i--) {
+        size_t entryPos = sizeof(ShotIndexHeader) + (i - 1) * sizeof(ShotIndexEntry);
+        ShotIndexEntry entry{};
+        if (!readEntryAtPosition(indexFile, entryPos, entry)) {
+            break;
+        }
+        if (entry.flags & SHOT_FLAG_DELETED) {
+            continue;
+        }
+        outEntries[found++] = entry;
+    }
+
+    indexFile.close();
+    return found;
+}
+
+void ShotHistoryPlugin::startAsyncRebuild() {
+    if (!rebuildInProgress) {
+        rebuildInProgress = true; // Set immediately to prevent multiple rebuilds
+        ESP_LOGI("ShotHistoryPlugin", "Starting immediate async rebuild task");
+
+        // Create a dedicated task for rebuild instead of using the existing loop
+        xTaskCreatePinnedToCore(
+            [](void *param) {
+                auto *plugin = static_cast<ShotHistoryPlugin *>(param);
+                ESP_LOGI("ShotHistoryPlugin", "Rebuild task started");
+                plugin->rebuildIndex();
+                plugin->rebuildInProgress = false;
+                ESP_LOGI("ShotHistoryPlugin", "Rebuild task completed");
+                vTaskDelete(NULL); // Delete this task when done
+            },
+            "ShotHistoryRebuild",
+            configMINIMAL_STACK_SIZE * 8, // Larger stack for file operations
+            this,
+            2, // Higher priority than normal
+            NULL, 0);
+    } else {
+        ESP_LOGW("ShotHistoryPlugin", "Rebuild already in progress, ignoring request");
+    }
+}
+
 void ShotHistoryPlugin::rebuildIndex() {
     ESP_LOGI("ShotHistoryPlugin", "Starting index rebuild...");
+
+    // Send scanning event
+    if (pluginManager) {
+        Event startEvent;
+        startEvent.id = "evt:history-rebuild-progress";
+        startEvent.setInt("total", 0);
+        startEvent.setInt("current", 0);
+        startEvent.setString("status", "scanning");
+        pluginManager->trigger(startEvent);
+    }
 
     // Delete existing index
     fs->remove("/h/index.bin");
@@ -671,12 +862,32 @@ void ShotHistoryPlugin::rebuildIndex() {
     // Create new empty index
     if (!ensureIndexExists()) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to create index during rebuild");
+        // Emit error event
+        if (pluginManager) {
+            Event errorEvent;
+            errorEvent.id = "evt:history-rebuild-progress";
+            errorEvent.setInt("total", 0);
+            errorEvent.setInt("current", 0);
+            errorEvent.setString("status", "error");
+            pluginManager->trigger(errorEvent);
+        }
         return;
     }
 
     File directory = fs->open("/h");
     if (!directory || !directory.isDirectory()) {
         ESP_LOGW("ShotHistoryPlugin", "No history directory found");
+        if (directory)
+            directory.close();
+        // Emit completion event even if no directory exists
+        if (pluginManager) {
+            Event completedEvent;
+            completedEvent.id = "evt:history-rebuild-progress";
+            completedEvent.setInt("total", 0);
+            completedEvent.setInt("current", 0);
+            completedEvent.setString("status", "completed");
+            pluginManager->trigger(completedEvent);
+        }
         return;
     }
 
@@ -688,6 +899,7 @@ void ShotHistoryPlugin::rebuildIndex() {
         if (fname.endsWith(".slog")) {
             slogFiles.push_back(fname);
         }
+        file.close();
         file = directory.openNextFile();
     }
     directory.close();
@@ -697,7 +909,20 @@ void ShotHistoryPlugin::rebuildIndex() {
 
     ESP_LOGI("ShotHistoryPlugin", "Rebuilding index from %d shot files", slogFiles.size());
 
+    // Emit start event with total file count
+    if (pluginManager) {
+        Event startEvent;
+        startEvent.id = "evt:history-rebuild-progress";
+        startEvent.setInt("total", (int)slogFiles.size());
+        startEvent.setInt("current", 0);
+        startEvent.setString("status", "started");
+        pluginManager->trigger(startEvent);
+    }
+
+    int currentIndex = 0;
+    uint32_t maxId = controller->getSettings().getHistoryIndex();
     for (const String &fileName : slogFiles) {
+        currentIndex++;
         File shotFile = fs->open("/h/" + fileName, "r");
         if (!shotFile) {
             continue;
@@ -715,6 +940,9 @@ void ShotHistoryPlugin::rebuildIndex() {
         int start = fileName.lastIndexOf('/') + 1;
         int end = fileName.lastIndexOf('.');
         uint32_t shotId = fileName.substring(start, end).toInt();
+        if (shotId > maxId) {
+            maxId = shotId;
+        }
 
         // Create index entry
         ShotIndexEntry entry{};
@@ -734,6 +962,43 @@ void ShotHistoryPlugin::rebuildIndex() {
             entry.flags &= ~SHOT_FLAG_COMPLETED;
         }
 
+        // Recompute the per-shot aggregates from the sample records (same math
+        // as the running sums in record()).
+        {
+            uint32_t tempSum = 0, tempCount = 0, flowSum = 0, flowCount = 0;
+            uint16_t maxPressure = 0;
+            ShotLogSample sample{};
+            shotFile.seek(shotHeader.headerSize, SeekSet);
+            for (uint32_t s = 0; s < shotHeader.sampleCount; s++) {
+                // v1-v5 used a 26-byte record with a 16-bit t field. The
+                // aggregate fields begin two bytes later in v6 because t is
+                // now uint32_t; decode both layouts while rebuilding indexes.
+                const size_t expectedSampleSize = shotHeader.version >= 6 ? 28 : 26;
+                const size_t sampleSize = shotHeader.reserved0 ? shotHeader.reserved0 : expectedSampleSize;
+                if (sampleSize != expectedSampleSize) {
+                    break;
+                }
+                uint8_t raw[sizeof(ShotLogSample)]{};
+                if (shotFile.read(raw, sampleSize) != sampleSize) {
+                    break;
+                }
+                const size_t valueOffset = shotHeader.version >= 6 ? 4 : 2;
+                memcpy(reinterpret_cast<uint8_t *>(&sample.tt), raw + valueOffset, sampleSize - valueOffset);
+                tempSum += sample.ct;
+                tempCount++;
+                if (sample.cp > maxPressure) {
+                    maxPressure = sample.cp;
+                }
+                if (sample.fl > 0) {
+                    flowSum += sample.fl;
+                    flowCount++;
+                }
+            }
+            entry.avgTemp = tempCount ? static_cast<uint16_t>(tempSum / tempCount) : 0;
+            entry.maxPressure = maxPressure;
+            entry.avgFlow = flowCount ? static_cast<uint16_t>(flowSum / flowCount) : 0;
+        }
+
         // Check for notes and extract rating and volume override
         String notesPath = "/h/" + String(shotId, 10) + ".json";
         if (fs->exists(notesPath)) {
@@ -744,7 +1009,7 @@ void ShotHistoryPlugin::rebuildIndex() {
                 String notesStr = notesFile.readString();
                 notesFile.close();
 
-                JsonDocument notesDoc;
+                JsonDocument notesDoc(&psramAllocator);
                 if (deserializeJson(notesDoc, notesStr) == DeserializationError::Ok) {
                     entry.rating = notesDoc["rating"].as<uint8_t>();
 
@@ -763,6 +1028,36 @@ void ShotHistoryPlugin::rebuildIndex() {
 
         // Append to index
         appendToIndex(entry);
+
+        // Emit progress update with adaptive frequency
+        // Update every file for small rebuilds, every few files for larger ones
+        int updateFrequency = slogFiles.size() <= 20 ? 1 : (slogFiles.size() <= 100 ? 3 : 5);
+        if (pluginManager && (currentIndex % updateFrequency == 0 || currentIndex == slogFiles.size())) {
+            Event progressEvent;
+            progressEvent.id = "evt:history-rebuild-progress";
+            progressEvent.setInt("total", (int)slogFiles.size());
+            progressEvent.setInt("current", currentIndex);
+            progressEvent.setString("status", "processing");
+            pluginManager->trigger(progressEvent);
+            ESP_LOGI("ShotHistoryPlugin", "Rebuild progress: %d/%d", currentIndex, (int)slogFiles.size());
+
+            // Small delay to allow UI updates and prevent overwhelming the system
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (maxId > controller->getSettings().getHistoryIndex()) {
+        controller->getSettings().setHistoryIndex(maxId);
+    }
+
+    // Emit completion event
+    if (pluginManager) {
+        Event completionEvent;
+        completionEvent.id = "evt:history-rebuild-progress";
+        completionEvent.setInt("total", (int)slogFiles.size());
+        completionEvent.setInt("current", (int)slogFiles.size());
+        completionEvent.setString("status", "completed");
+        pluginManager->trigger(completionEvent);
     }
 
     ESP_LOGI("ShotHistoryPlugin", "Index rebuild completed");
@@ -815,63 +1110,4 @@ bool ShotHistoryPlugin::writeEntryAtPosition(File &indexFile, size_t position, c
         return false;
     }
     return true;
-}
-
-void ShotHistoryPlugin::createEarlyIndexEntry() {
-    Profile profile = controller->getProfileManager()->getSelectedProfile();
-
-    ShotIndexEntry indexEntry{};
-    indexEntry.id = currentId.toInt();
-    indexEntry.timestamp = header.startEpoch;
-    indexEntry.duration = 0; // Will be updated on completion
-    indexEntry.volume = 0;   // Will be updated on completion
-    indexEntry.rating = 0;
-    indexEntry.flags = 0; // No SHOT_FLAG_COMPLETED - indicates incomplete shot
-    strncpy(indexEntry.profileId, profile.id.c_str(), sizeof(indexEntry.profileId) - 1);
-    indexEntry.profileId[sizeof(indexEntry.profileId) - 1] = '\0';
-    strncpy(indexEntry.profileName, profile.label.c_str(), sizeof(indexEntry.profileName) - 1);
-    indexEntry.profileName[sizeof(indexEntry.profileName) - 1] = '\0';
-
-    appendToIndex(indexEntry);
-    ESP_LOGD("ShotHistoryPlugin", "Created early index entry for shot %u", indexEntry.id);
-}
-
-void ShotHistoryPlugin::updateIndexCompletion(uint32_t shotId, const ShotLogHeader &finalHeader) {
-    File indexFile = fs->open("/h/index.bin", "r+");
-    if (!indexFile) {
-        ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for completion update");
-        return;
-    }
-
-    ShotIndexHeader header{};
-    if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
-        return;
-    }
-
-    int entryPos = findEntryPosition(indexFile, header, shotId);
-    if (entryPos >= 0) {
-        ShotIndexEntry entry{};
-        if (readEntryAtPosition(indexFile, entryPos, entry)) {
-            // Update with final shot data
-            entry.duration = finalHeader.durationMs;
-            entry.volume = finalHeader.finalWeight;
-            entry.flags |= SHOT_FLAG_COMPLETED; // Mark as completed
-
-            if (writeEntryAtPosition(indexFile, entryPos, entry)) {
-                ESP_LOGD("ShotHistoryPlugin", "Updated shot %u completion: duration=%u, volume=%u", shotId, entry.duration,
-                         entry.volume);
-                indexFile.close();
-                return;
-            } else {
-                ESP_LOGE("ShotHistoryPlugin", "Failed to write completion data for shot %u", shotId);
-            }
-        } else {
-            ESP_LOGE("ShotHistoryPlugin", "Failed to read entry for shot %u at position %d", shotId, entryPos);
-        }
-    } else {
-        ESP_LOGW("ShotHistoryPlugin", "Shot %u not found in index for completion update", shotId);
-    }
-
-    indexFile.close();
 }

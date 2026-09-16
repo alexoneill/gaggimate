@@ -21,17 +21,24 @@ class DimmedPump : public Pump {
     float getPumpFlow();
     float getPuckFlow();
     float getPuckResistance();
-    float* getPumpFlowPtr() { return &_currentFlow; }  // For thermal feedforward
-    int* getValveStatusPtr() { return &_valveStatus; }  // For thermal feedforward valve state
+    float getPressureTarget() { return _ctrlPressure; }
+    float getFlowTarget() { return _ctrlFlow; }
+    float *getPumpPowerPtr() override { return &_power; } // For external pump control
+    float *getPumpFlowPtr() { return &_currentFlow; }     // For thermal feedforward
+    float getPumpedWater() { return _pumpedWater; }
+    int *getValveStatusPtr() { return &_valveStatus; } // For thermal feedforward valve state
     void tare();
 
     void setFlowTarget(float targetFlow, float pressureLimit);
     void setPressureTarget(float targetPressure, float flowLimit);
     void setPumpFlowCoeff(float oneBarFlow, float nineBarFlow);
     void setPumpFlowPolyCoeffs(float a, float b, float c, float d);
+    void setPumpSlipPolyCoeffs(float a, float b, float c, float d);
+    void setGains(float commutationGain, float convergenceGain, float integralGain);
     void stop();
     void fullPower();
     void setValveState(bool open);
+    void setBinaryMode(bool binaryMode);
 
   private:
     uint8_t _ssr_pin;
@@ -39,6 +46,7 @@ class DimmedPump : public Pump {
     PSM _psm;
     PressureSensor *_pressureSensor;
     PressureController _pressureController;
+
     xTaskHandle taskHandle;
 
     ControlMode _mode = ControlMode::POWER;
@@ -49,8 +57,10 @@ class DimmedPump : public Pump {
     float _currentPressure = 0.0f;
     float _currentFlow = 0.0f;
     float _lastPressure = 0.0f;
+    float _pumpedWater = 0.0f;
     int _valveStatus = 0;
     int _cps = MAX_FREQ;
+    bool _binaryMode = false;
 
     float _opvPressure = 0.0f;
 

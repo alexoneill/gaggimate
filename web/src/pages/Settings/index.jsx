@@ -1,91 +1,242 @@
-import { useQuery } from 'preact-fetching';
-import { Spinner } from '../../components/Spinner.jsx';
-import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import Card from '../../components/Card.jsx';
-import { timezones } from '../../config/zones.js';
-import { computed } from '@preact/signals';
-import { machine } from '../../services/ApiService.js';
-import { getStoredTheme, handleThemeChange } from '../../utils/themeManager.js';
-import { setDashboardLayout, DASHBOARD_LAYOUTS } from '../../utils/dashboardManager.js';
-import { PluginCard } from './PluginCard.jsx';
-import { downloadJson } from '../../utils/download.js';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faFileExport } from '@fortawesome/free-solid-svg-icons/faFileExport';
 import { faFileImport } from '@fortawesome/free-solid-svg-icons/faFileImport';
-import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
+import { faEllipsisVertical } from '@fortawesome/free-solid-svg-icons/faEllipsisVertical';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { useCallback, useEffect, useRef, useState, useContext } from 'preact/hooks';
+import { useRoute } from 'preact-iso';
+import {
+  ApiServiceContext,
+  machine,
+  prefetchSettings,
+  updateSettingsCache,
+  getCachedSettings,
+} from '../../services/ApiService.js';
+import {
+  DASHBOARD_LAYOUTS,
+  setDashboardLayout,
+  setClock24h,
+} from '../../utils/dashboardManager.js';
+import { downloadJson } from '../../utils/download.js';
+import { getStoredTheme, handleThemeChange } from '../../utils/themeManager.js';
 
-const ledControl = computed(() => machine.value.capabilities.ledControl);
-const pressureAvailable = computed(() => machine.value.capabilities.pressure);
+import PageLayout from '../../components/PageLayout.jsx';
+import PageHeader from '../../components/PageHeader.jsx';
+import TabBar from '../../components/TabBar.jsx';
+
+import lazy from 'preact-iso/lazy';
+
+import { StickyFormFooter } from './StickyFormFooter.jsx';
+import {
+  GeneralTabSkeleton,
+  MachineTabSkeleton,
+  PluginsTabSkeleton,
+  BluetoothTabSkeleton,
+  SystemTabSkeleton,
+} from '../../components/skeletons/SettingsSkeletons.jsx';
+import { GeneralTab } from './tabs/GeneralTab.jsx';
+
+const LazyMachineTab = lazy(() => import('./tabs/MachineTab.jsx').then(m => m.MachineTab));
+const LazyCalibrationTab = lazy(() =>
+  import('./tabs/CalibrationTab.jsx').then(m => m.CalibrationTab),
+);
+const LazyPluginsTab = lazy(() => import('./tabs/PluginsTab.jsx').then(m => m.PluginsTab));
+const LazyBluetoothTab = lazy(() => import('./tabs/BluetoothTab.jsx').then(m => m.BluetoothTab));
+const LazySystemTab = lazy(() => import('./tabs/SystemTab.jsx').then(m => m.SystemTab));
+
+const loadMachineTab = () => import('./tabs/MachineTab.jsx');
+const loadCalibrationTab = () => import('./tabs/CalibrationTab.jsx');
+const loadPluginsTab = () => import('./tabs/PluginsTab.jsx');
+const loadBluetoothTab = () => import('./tabs/BluetoothTab.jsx');
+const loadSystemTab = () => import('./tabs/SystemTab.jsx');
+
+// Icons
+import { faSliders } from '@fortawesome/free-solid-svg-icons/faSliders';
+import { faTemperatureHalf } from '@fortawesome/free-solid-svg-icons/faTemperatureHalf';
+import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
+import { faPuzzlePiece } from '@fortawesome/free-solid-svg-icons/faPuzzlePiece';
+import { faBluetoothB } from '@fortawesome/free-brands-svg-icons/faBluetoothB';
+import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
+
+function splitPidString(pidString) {
+  if (!pidString) return { pid: pidString, kf: '0.000' };
+  const parts = pidString.split(',');
+  if (parts.length >= 4) {
+    return { pid: parts.slice(0, 3).join(','), kf: parts[3] };
+  }
+  return { pid: pidString, kf: '0.000' };
+}
+
+function splitButtons(buttonBehavior) {
+  if (!buttonBehavior) return {};
+  const [button0, button1, button2] = buttonBehavior.split(',');
+  return { button0, button1, button2 };
+}
+
+function parseAutoWakeupSchedules(autowakeupSchedules) {
+  const defaultSchedule = [{ time: '07:00', days: [true, true, true, true, true, true, true] }];
+  if (!autowakeupSchedules) {
+    return defaultSchedule;
+  }
+  const schedules = [];
+  if (typeof autowakeupSchedules === 'string' && autowakeupSchedules.trim()) {
+    const scheduleStrings = autowakeupSchedules.split(';');
+    for (const scheduleStr of scheduleStrings) {
+      const [time, daysStr] = scheduleStr.split('|');
+      if (time && daysStr && daysStr.length === 7) {
+        const days = daysStr.split('').map(d => d === '1');
+        schedules.push({ time, days });
+      }
+    }
+  }
+  return schedules.length > 0 ? schedules : defaultSchedule;
+}
+
+function transformFetchedSettings(fetchedSettings) {
+  if (!fetchedSettings) return {};
+  const buttonFields = fetchedSettings.buttonBehavior
+    ? splitButtons(fetchedSettings.buttonBehavior)
+    : {};
+  const settingsWithToggle = {
+    ...fetchedSettings,
+    ...buttonFields,
+    standbyDisplayEnabled:
+      fetchedSettings.standbyDisplayEnabled !== undefined
+        ? fetchedSettings.standbyDisplayEnabled
+        : fetchedSettings.standbyBrightness > 0,
+    dashboardLayout: fetchedSettings.dashboardLayout || DASHBOARD_LAYOUTS.ORDER_FIRST,
+  };
+
+  if (fetchedSettings.pid) {
+    const split = splitPidString(fetchedSettings.pid);
+    settingsWithToggle.pid = split.pid;
+    settingsWithToggle.kf = split.kf;
+  }
+  return settingsWithToggle;
+}
+
+function buildSubmitFormData(formData, autowakeupSchedules, restart) {
+  const formDataToSubmit = new FormData();
+  const checkboxKeys = [
+    'homekit',
+    'boilerFillActive',
+    'smartGrindActive',
+    'homeAssistant',
+    'momentaryButtons',
+    'delayAdjust',
+    'clock24hFormat',
+    'autowakeupEnabled',
+    'smartGrindToggle',
+  ];
+
+  for (const [key, value] of Object.entries(formData)) {
+    if (value === undefined || value === null) continue;
+
+    if (checkboxKeys.includes(key)) {
+      if (value) {
+        formDataToSubmit.set(key, '1');
+      }
+    } else {
+      formDataToSubmit.set(key, String(value));
+    }
+  }
+
+  formDataToSubmit.set('steamPumpPercentage', String(formData.steamPumpPercentage ?? 0));
+  formDataToSubmit.set(
+    'altRelayFunction',
+    formData.altRelayFunction !== undefined ? String(formData.altRelayFunction) : '1',
+  );
+  formDataToSubmit.set(
+    'buttonBehavior',
+    `${formData.button0},${formData.button1},${formData.button2}`,
+  );
+
+  if (formData.pid && formData.kf !== undefined) {
+    const combinedPid = `${formData.pid},${formData.kf}`;
+    formDataToSubmit.set('pid', combinedPid);
+  }
+
+  const schedulesStr = autowakeupSchedules
+    .map(schedule => `${schedule.time}|${schedule.days.map(d => (d ? '1' : '0')).join('')}`)
+    .join(';');
+  formDataToSubmit.set('autowakeupSchedules', schedulesStr);
+
+  if (!formData.standbyDisplayEnabled) {
+    formDataToSubmit.set('standbyBrightness', '0');
+  }
+
+  if (restart) {
+    formDataToSubmit.append('restart', '1');
+  }
+
+  return formDataToSubmit;
+}
 
 export function Settings() {
+  const apiService = useContext(ApiServiceContext);
+  const { params } = useRoute();
+  const tab = params.tab || 'general';
+  const isFormTab = ['general', 'machine', 'plugins'].includes(tab);
+
+  const [profiles, setProfiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
-  const [gen] = useState(0);
   const [formData, setFormData] = useState({});
   const [currentTheme, setCurrentTheme] = useState('light');
+  const [showWifiPassword, setShowWifiPassword] = useState(false);
+  const [showApPassword, setShowApPassword] = useState(false);
   const [autowakeupSchedules, setAutoWakeupSchedules] = useState([
-    { time: '07:00', days: [true, true, true, true, true, true, true] }, // Default: all days enabled
+    { time: '07:00', days: [true, true, true, true, true, true, true] },
   ]);
-  const { isLoading, data: fetchedSettings } = useQuery(`settings/${gen}`, async () => {
-    const response = await fetch(`/api/settings`);
-    const data = await response.json();
-    return data;
-  });
+
+  const [fetchedSettings, setFetchedSettings] = useState(() => getCachedSettings());
+  const [isLoading, setIsLoading] = useState(!fetchedSettings);
+
+  useEffect(() => {
+    if (!fetchedSettings) {
+      prefetchSettings()
+        .then(data => {
+          setFetchedSettings(data);
+          setIsLoading(false);
+        })
+        .catch(err => {
+          console.error('Failed to prefetch settings:', err);
+          setIsLoading(false);
+        });
+    }
+  }, [fetchedSettings]);
+
+  useEffect(() => {
+    const loadProfiles = async () => {
+      if (machine.value.connected) {
+        const response = await apiService.request({ tp: 'req:profiles:list', minimal: true });
+        setProfiles(response.profiles);
+      }
+    };
+    loadProfiles();
+  }, [machine.value.connected, apiService]);
 
   const formRef = useRef();
+  const dropdownRef = useRef(null);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+
+    const handleOutsideClick = event => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener('click', handleOutsideClick);
+    return () => document.removeEventListener('click', handleOutsideClick);
+  }, [dropdownOpen]);
 
   useEffect(() => {
     if (fetchedSettings) {
-      // Initialize standbyDisplayEnabled based on standby brightness value
-      // but preserve it if it already exists in the fetched data
-      const settingsWithToggle = {
-        ...fetchedSettings,
-        standbyDisplayEnabled:
-          fetchedSettings.standbyDisplayEnabled !== undefined
-            ? fetchedSettings.standbyDisplayEnabled
-            : fetchedSettings.standbyBrightness > 0,
-        dashboardLayout: fetchedSettings.dashboardLayout || DASHBOARD_LAYOUTS.ORDER_FIRST,
-      };
-
-      // Extract Kf from PID string and separate them
-      if (fetchedSettings.pid) {
-        const pidParts = fetchedSettings.pid.split(',');
-        if (pidParts.length >= 4) {
-          // PID string has Kf as 4th parameter
-          settingsWithToggle.pid = pidParts.slice(0, 3).join(','); // First 3 params
-          settingsWithToggle.kf = pidParts[3]; // 4th parameter
-        } else {
-          // No Kf in PID string, use default
-          settingsWithToggle.kf = '0.000';
-        }
-      }
-
-      // Initialize auto-wakeup schedules
-      if (fetchedSettings.autowakeupSchedules) {
-        // Parse new schedule format: "time1|days1;time2|days2"
-        const schedules = [];
-        if (
-          typeof fetchedSettings.autowakeupSchedules === 'string' &&
-          fetchedSettings.autowakeupSchedules.trim()
-        ) {
-          const scheduleStrings = fetchedSettings.autowakeupSchedules.split(';');
-          for (const scheduleStr of scheduleStrings) {
-            const [time, daysStr] = scheduleStr.split('|');
-            if (time && daysStr && daysStr.length === 7) {
-              const days = daysStr.split('').map(d => d === '1');
-              schedules.push({ time, days });
-            }
-          }
-        }
-        if (schedules.length === 0) {
-          schedules.push({ time: '07:00', days: [true, true, true, true, true, true, true] });
-        }
-        setAutoWakeupSchedules(schedules);
-      } else {
-        setAutoWakeupSchedules([
-          { time: '07:00', days: [true, true, true, true, true, true, true] },
-        ]);
-      }
-
+      const settingsWithToggle = transformFetchedSettings(fetchedSettings);
+      const parsedSchedules = parseAutoWakeupSchedules(fetchedSettings.autowakeupSchedules);
+      setAutoWakeupSchedules(parsedSchedules);
+      setClock24h(!!fetchedSettings.clock24hFormat);
       setFormData(settingsWithToggle);
     } else {
       setFormData({});
@@ -93,7 +244,6 @@ export function Settings() {
     }
   }, [fetchedSettings]);
 
-  // Initialize theme
   useEffect(() => {
     setCurrentTheme(getStoredTheme());
   }, []);
@@ -101,36 +251,26 @@ export function Settings() {
   const onChange = key => {
     return e => {
       let value = e.currentTarget.value;
-      if (key === 'homekit') {
-        value = !formData.homekit;
-      }
-      if (key === 'boilerFillActive') {
-        value = !formData.boilerFillActive;
-      }
-      if (key === 'smartGrindActive') {
-        value = !formData.smartGrindActive;
-      }
-      if (key === 'smartGrindToggle') {
-        value = !formData.smartGrindToggle;
-      }
-      if (key === 'homeAssistant') {
-        value = !formData.homeAssistant;
-      }
-      if (key === 'momentaryButtons') {
-        value = !formData.momentaryButtons;
-      }
-      if (key === 'delayAdjust') {
-        value = !formData.delayAdjust;
+      if (
+        [
+          'homekit',
+          'boilerFillActive',
+          'smartGrindActive',
+          'smartGrindToggle',
+          'homeAssistant',
+          'momentaryButtons',
+          'delayAdjust',
+          'clock24hFormat',
+          'autowakeupEnabled',
+        ].includes(key)
+      ) {
+        value = !formData[key];
       }
       if (key === 'clock24hFormat') {
-        value = !formData.clock24hFormat;
-      }
-      if (key === 'autowakeupEnabled') {
-        value = !formData.autowakeupEnabled;
+        setClock24h(value);
       }
       if (key === 'standbyDisplayEnabled') {
         value = !formData.standbyDisplayEnabled;
-        // Set standby brightness to 0 when toggle is off
         const newFormData = {
           ...formData,
           [key]: value,
@@ -150,6 +290,10 @@ export function Settings() {
       });
     };
   };
+
+  const setField = useCallback((key, value) => {
+    setFormData(prev => ({ ...prev, [key]: value }));
+  }, []);
 
   const addAutoWakeupSchedule = () => {
     setAutoWakeupSchedules([
@@ -182,53 +326,38 @@ export function Settings() {
 
   const onSubmit = useCallback(
     async (e, restart = false) => {
-      e.preventDefault();
+      if (e) e.preventDefault();
       setSubmitting(true);
       const form = formRef.current;
-      const formDataToSubmit = new FormData(form);
-      formDataToSubmit.set('steamPumpPercentage', formData.steamPumpPercentage);
-      formDataToSubmit.set(
-        'altRelayFunction',
-        formData.altRelayFunction !== undefined ? formData.altRelayFunction : 1,
-      );
+      const formDataToSubmit = buildSubmitFormData(formData, autowakeupSchedules, restart);
 
-      // Combine PID and Kf into single PID string
-      if (formData.pid && formData.kf !== undefined) {
-        const combinedPid = `${formData.pid},${formData.kf}`;
-        formDataToSubmit.set('pid', combinedPid);
+      try {
+        const response = await fetch(form.action, {
+          method: 'post',
+          body: formDataToSubmit,
+        });
+        const data = await response.json();
+
+        const splitPid = data.pid ? splitPidString(data.pid) : null;
+        const buttonFields = data.buttonBehavior ? splitButtons(data.buttonBehavior) : {};
+
+        const updatedData = {
+          ...data,
+          ...(splitPid !== null ? { pid: splitPid.pid, kf: splitPid.kf } : {}),
+          ...buttonFields,
+          standbyDisplayEnabled:
+            data.standbyBrightness > 0 ? formData.standbyDisplayEnabled : false,
+        };
+
+        updateSettingsCache(data);
+        setFormData(updatedData);
+      } catch (error) {
+        console.error('Failed to save settings:', error);
+      } finally {
+        setSubmitting(false);
       }
-
-      // Add auto-wakeup schedules
-      const schedulesStr = autowakeupSchedules
-        .map(schedule => `${schedule.time}|${schedule.days.map(d => (d ? '1' : '0')).join('')}`)
-        .join(';');
-      formDataToSubmit.set('autowakeupSchedules', schedulesStr);
-
-      // Ensure standbyBrightness is included even when the field is disabled
-      if (!formData.standbyDisplayEnabled) {
-        formDataToSubmit.set('standbyBrightness', '0');
-      }
-
-      if (restart) {
-        formDataToSubmit.append('restart', '1');
-      }
-      const response = await fetch(form.action, {
-        method: 'post',
-        body: formDataToSubmit,
-      });
-      const data = await response.json();
-
-      // Only preserve standbyDisplayEnabled if brightness is greater than 0
-      // If brightness is 0, let the useEffect recalculate it based on the saved value
-      const updatedData = {
-        ...data,
-        standbyDisplayEnabled: data.standbyBrightness > 0 ? formData.standbyDisplayEnabled : false,
-      };
-
-      setFormData(updatedData);
-      setSubmitting(false);
     },
-    [setFormData, formRef, formData, autowakeupSchedules],
+    [formData, autowakeupSchedules],
   );
 
   const onExport = useCallback(() => {
@@ -247,686 +376,112 @@ export function Settings() {
     }
   };
 
-  if (isLoading) {
-    return (
-      <div className='flex w-full flex-row items-center justify-center py-16'>
-        <Spinner size={8} />
-      </div>
-    );
-  }
+  const settingsTabs = [
+    { id: 'general', label: 'General', icon: faSliders },
+    { id: 'machine', label: 'Machine', icon: faTemperatureHalf, preload: loadMachineTab },
+    { id: 'calibration', label: 'Calibration', icon: faCrosshairs, preload: loadCalibrationTab },
+    { id: 'plugins', label: 'Plugins', icon: faPuzzlePiece, preload: loadPluginsTab },
+    { id: 'bluetooth', label: 'Bluetooth', icon: faBluetoothB, preload: loadBluetoothTab },
+    { id: 'system', label: 'System & Updates', icon: faRotate, preload: loadSystemTab },
+  ];
 
   return (
-    <>
-      <div className='mb-4 flex flex-row items-center gap-2'>
-        <h2 className='flex-grow text-2xl font-bold sm:text-3xl'>Settings</h2>
-        <button
-          type='button'
-          onClick={onExport}
-          className='btn btn-ghost btn-sm'
-          title='Export Settings'
-        >
-          <FontAwesomeIcon icon={faFileExport} />
-        </button>
-        <label
-          htmlFor='settingsImport'
-          className='btn btn-ghost btn-sm cursor-pointer'
-          title='Import Settings'
-        >
-          <FontAwesomeIcon icon={faFileImport} />
-        </label>
-        <input
-          onChange={onUpload}
-          className='hidden'
-          id='settingsImport'
-          type='file'
-          accept='.json,application/json'
-        />
-      </div>
-      <form key='settings' ref={formRef} method='post' action='/api/settings' onSubmit={onSubmit}>
-        <div className='grid grid-cols-1 gap-4 lg:grid-cols-10'>
-          <Card sm={10} lg={5} title='Temperature settings'>
-            <div className='form-control'>
-              <label htmlFor='targetSteamTemp' className='mb-2 block text-sm font-medium'>
-                Default Steam Temperature (°C)
-              </label>
-              <input
-                id='targetSteamTemp'
-                name='targetSteamTemp'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='135'
-                value={formData.targetSteamTemp}
-                onChange={onChange('targetSteamTemp')}
-              />
-            </div>
+    <PageLayout>
+      <PageHeader
+        title='Settings'
+        noStack={true}
+        tabs={<TabBar tabs={settingsTabs} activeTab={tab} basePath='/settings' />}
+        actions={
+          <div
+            className={`action-dropdown relative ${dropdownOpen ? 'action-dropdown-open' : ''}`}
+            ref={dropdownRef}
+          >
+            <button
+              onClick={() => setDropdownOpen(open => !open)}
+              className='btn btn-ghost btn-circle text-base-content/85 hover:bg-base-content/10'
+              aria-label='More options'
+              aria-expanded={dropdownOpen}
+            >
+              <FontAwesomeIcon icon={faEllipsisVertical} size='lg' />
+            </button>
+            <ul className='menu action-dropdown-menu bg-base-100 rounded-box border-base-content/10 right-0 z-50 mt-1 w-52 border p-2 shadow-lg'>
+              <li>
+                <button
+                  type='button'
+                  onClick={() => {
+                    onExport();
+                    setDropdownOpen(false);
+                  }}
+                  className='justify-start gap-2 font-medium'
+                  aria-label='Export settings'
+                >
+                  <FontAwesomeIcon icon={faFileExport} />
+                  <span>Export Settings</span>
+                </button>
+              </li>
+              <li>
+                <button
+                  type='button'
+                  onClick={() => {
+                    document.getElementById('settingsImport')?.click();
+                    setDropdownOpen(false);
+                  }}
+                  className='justify-start gap-2 font-medium'
+                  aria-label='Import settings'
+                >
+                  <FontAwesomeIcon icon={faFileImport} />
+                  <span>Import Settings</span>
+                </button>
+              </li>
+            </ul>
+            <input
+              onChange={onUpload}
+              className='hidden'
+              id='settingsImport'
+              type='file'
+              accept='.json,application/json'
+            />
+          </div>
+        }
+      />
 
-            <div className='form-control'>
-              <label htmlFor='targetWaterTemp' className='mb-2 block text-sm font-medium'>
-                Default Water Temperature (°C)
-              </label>
-              <input
-                id='targetWaterTemp'
-                name='targetWaterTemp'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='80'
-                value={formData.targetWaterTemp}
-                onChange={onChange('targetWaterTemp')}
-              />
-            </div>
-          </Card>
-
-          <Card sm={10} lg={5} title='User preferences'>
-            <div className='form-control'>
-              <label htmlFor='startup-mode' className='mb-2 block text-sm font-medium'>
-                Startup Mode
-              </label>
-              <select
-                id='startup-mode'
-                name='startupMode'
-                className='select select-bordered w-full'
-                onChange={onChange('startupMode')}
-              >
-                <option value='standby' selected={formData.startupMode === 'standby'}>
-                  Standby
-                </option>
-                <option value='brew' selected={formData.startupMode === 'brew'}>
-                  Brew
-                </option>
-              </select>
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='standbyTimeout' className='mb-2 block text-sm font-medium'>
-                Standby Timeout (s)
-              </label>
-              <input
-                id='standbyTimeout'
-                name='standbyTimeout'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='0'
-                value={formData.standbyTimeout}
-                onChange={onChange('standbyTimeout')}
-              />
-            </div>
-
-            <div className='divider'>Predictive scale delay</div>
-            <div className='mb-2 text-sm opacity-70'>
-              Shuts off the process ahead of time based on the flow rate to account for any dripping
-              or delays in the control.
-            </div>
-
-            <div className='form-control'>
-              <label className='label cursor-pointer'>
-                <span className='label-text'>Auto Adjust</span>
-                <input
-                  id='delayAdjust'
-                  name='delayAdjust'
-                  value='delayAdjust'
-                  type='checkbox'
-                  className='toggle toggle-primary'
-                  checked={!!formData.delayAdjust}
-                  onChange={onChange('delayAdjust')}
-                />
-              </label>
-            </div>
-
-            <div className='grid grid-cols-2 gap-4'>
-              <div className='form-control'>
-                <label htmlFor='brewDelay' className='mb-2 block text-sm font-medium'>
-                  Brew (ms)
-                </label>
-                <input
-                  id='brewDelay'
-                  name='brewDelay'
-                  type='number'
-                  step='any'
-                  className='input input-bordered w-full'
-                  placeholder='0'
-                  value={formData.brewDelay}
-                  onChange={onChange('brewDelay')}
-                />
-              </div>
-              <div className='form-control'>
-                <label htmlFor='grindDelay' className='mb-2 block text-sm font-medium'>
-                  Grind (ms)
-                </label>
-                <input
-                  id='grindDelay'
-                  name='grindDelay'
-                  type='number'
-                  step='any'
-                  className='input input-bordered w-full'
-                  placeholder='0'
-                  value={formData.grindDelay}
-                  onChange={onChange('grindDelay')}
-                />
-              </div>
-            </div>
-
-            <div className='divider'>Switch control</div>
-            <div className='form-control'>
-              <label className='label cursor-pointer'>
-                <span className='label-text'>Use momentary switches</span>
-                <input
-                  id='momentaryButtons'
-                  name='momentaryButtons'
-                  value='momentaryButtons'
-                  type='checkbox'
-                  className='toggle toggle-primary'
-                  checked={!!formData.momentaryButtons}
-                  onChange={onChange('momentaryButtons')}
-                />
-              </label>
-            </div>
-          </Card>
-
-          <Card sm={10} lg={5} title='Web Settings'>
-            <div className='form-control'>
-              <label htmlFor='webui-theme' className='label'>
-                <span className='label-text font-medium'>Theme</span>
-              </label>
-              <select
-                id='webui-theme'
-                name='webui-theme'
-                className='select select-bordered w-full'
-                value={currentTheme}
-                onChange={e => {
-                  setCurrentTheme(e.target.value);
-                  handleThemeChange(e);
-                }}
-              >
-                <option value='light'>Light</option>
-                <option value='dark'>Dark</option>
-                <option value='coffee'>Coffee</option>
-                <option value='nord'>Nord</option>
-              </select>
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='dashboardLayout' className='label'>
-                <span className='label-text font-medium'>Dashboard Layout</span>
-              </label>
-              <select
-                id='dashboardLayout'
-                name='dashboardLayout'
-                className='select select-bordered w-full'
-                value={formData.dashboardLayout || DASHBOARD_LAYOUTS.ORDER_FIRST}
-                onChange={e => {
-                  const value = e.target.value;
-                  setFormData({
-                    ...formData,
-                    dashboardLayout: value,
-                  });
-                  setDashboardLayout(value);
-                }}
-              >
-                <option value={DASHBOARD_LAYOUTS.ORDER_FIRST}>Process Controls First</option>
-                <option value={DASHBOARD_LAYOUTS.ORDER_LAST}>Chart First</option>
-              </select>
-            </div>
-          </Card>
-
-          <Card sm={10} lg={5} title='System preferences'>
-            <div className='form-control'>
-              <label htmlFor='wifiSsid' className='mb-2 block text-sm font-medium'>
-                WiFi SSID
-              </label>
-              <input
-                id='wifiSsid'
-                name='wifiSsid'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='WiFi SSID'
-                value={formData.wifiSsid}
-                onChange={onChange('wifiSsid')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='wifiPassword' className='mb-2 block text-sm font-medium'>
-                WiFi Password
-              </label>
-              <input
-                id='wifiPassword'
-                name='wifiPassword'
-                type='password'
-                className='input input-bordered w-full'
-                placeholder='WiFi Password'
-                value={formData.wifiPassword}
-                onChange={onChange('wifiPassword')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='mdnsName' className='mb-2 block text-sm font-medium'>
-                Hostname
-              </label>
-              <input
-                id='mdnsName'
-                name='mdnsName'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='Hostname'
-                value={formData.mdnsName}
-                onChange={onChange('mdnsName')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='timezone' className='mb-2 block text-sm font-medium'>
-                Timezone
-              </label>
-              <select
-                id='timezone'
-                name='timezone'
-                className='select select-bordered w-full'
-                onChange={onChange('timezone')}
-              >
-                {timezones.map(timezone => (
-                  <option key={timezone} value={timezone} selected={formData.timezone === timezone}>
-                    {timezone}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className='divider'>Clock</div>
-            <div className='form-control'>
-              <label className='label cursor-pointer'>
-                <span className='label-text'>Use 24h Format</span>
-                <input
-                  id='clock24hFormat'
-                  name='clock24hFormat'
-                  value='clock24hFormat'
-                  type='checkbox'
-                  className='toggle toggle-primary'
-                  checked={!!formData.clock24hFormat}
-                  onChange={onChange('clock24hFormat')}
-                />
-              </label>
-            </div>
-          </Card>
-
-          <Card sm={10} lg={5} title='Machine settings'>
-            <div className='form-control'>
-              <label htmlFor='pid' className='mb-2 block text-sm font-medium'>
-                PID Values (Kp, Ki, Kd)
-              </label>
-              <input
-                id='pid'
-                name='pid'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='2.0, 0.1, 0.01'
-                value={formData.pid}
-                onChange={onChange('pid')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='kf' className='mb-2 block text-sm font-medium'>
-                Thermal Feedforward Gain (Kff) - 0 to disable
-              </label>
-              <input
-                id='kf'
-                name='kf'
-                type='number'
-                step='0.001'
-                className='input input-bordered w-full'
-                placeholder='0.600'
-                value={formData.kf}
-                onChange={onChange('kf')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='pumpModelCoeffs' className='mb-2 block text-sm font-medium'>
-                Pump Flow Coefficients <small>Enter 2 values (flow at 1bar, flow at 9bar)</small>
-              </label>
-              <input
-                id='pumpModelCoeffs'
-                name='pumpModelCoeffs'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='10.205,5.521'
-                value={formData.pumpModelCoeffs}
-                onChange={onChange('pumpModelCoeffs')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='temperatureOffset' className='mb-2 block text-sm font-medium'>
-                Temperature Offset
-              </label>
-              <input
-                id='temperatureOffset'
-                name='temperatureOffset'
-                type='number'
-                inputMode='decimal'
-                className='input input-bordered w-full'
-                placeholder='0 °C'
-                min='0'
-                step='any'
-                value={formData.temperatureOffset}
-                onChange={onChange('temperatureOffset')}
-              />
-            </div>
-
-            {pressureAvailable.value && (
-              <div className='form-control'>
-                <label htmlFor='pressureScaling' className='mb-2 block text-sm font-medium'>
-                  Pressure sensor rating
-                </label>
-                <div className='mb-2 text-xs opacity-70'>
-                  Enter the bar rating of the pressure sensor being used
-                </div>
-                <input
-                  id='pressureScaling'
-                  name='pressureScaling'
-                  type='number'
-                  inputMode='decimal'
-                  className='input input-bordered w-full'
-                  placeholder='0.0 bar'
-                  min='0'
-                  step='any'
-                  value={formData.pressureScaling}
-                  onChange={onChange('pressureScaling')}
-                />
-              </div>
-            )}
-
-            <div className='form-control'>
-              <label htmlFor='steamPumpPercentage' className='mb-2 block text-sm font-medium'>
-                Steam Pump Assist
-              </label>
-              <div className='mb-2 text-xs opacity-70'>
-                {pressureAvailable.value
-                  ? 'How many ml/s to pump into the boiler during steaming'
-                  : 'What percentage to run the pump at during steaming'}
-              </div>
-              <input
-                id='steamPumpPercentage'
-                name='steamPumpPercentage'
-                type='number'
-                inputmode='decimal'
-                className='input input-bordered w-full'
-                placeholder={pressureAvailable.value ? '0.0 ml/s' : '0.0 %'}
-                min='0'
-                step='0.1'
-                value={String(formData.steamPumpPercentage * (pressureAvailable.value ? 0.1 : 1))}
-                onBlur={e =>
-                  setFormData({
-                    ...formData,
-                    steamPumpPercentage: (
-                      parseFloat(e.target.value) * (pressureAvailable.value ? 10 : 1)
-                    ).toFixed(0),
-                  })
-                }
-              />
-            </div>
-
-            {pressureAvailable.value && (
-              <div className='form-control'>
-                <label htmlFor='steamPumpCutoff' className='mb-2 block text-sm font-medium'>
-                  Pump Assist Cutoff
-                </label>
-                <div className='mb-2 text-xs opacity-70'>
-                  At how many bars should the pump assist stop. This makes it so the pump will only
-                  run when steam is flowing.
-                </div>
-                <input
-                  id='steamPumpCutoff'
-                  name='steamPumpCutoff'
-                  type='number'
-                  inputMode='decimal'
-                  className='input input-bordered w-full'
-                  placeholder='0.0 bar'
-                  min='0'
-                  step='any'
-                  value={formData.steamPumpCutoff}
-                  onChange={onChange('steamPumpCutoff')}
-                />
-              </div>
-            )}
-
-            <div className='form-control'>
-              <label htmlFor='altRelayFunction' className='mb-2 block text-sm font-medium'>
-                Alt Relay / SSR2 Function
-              </label>
-              <select
-                id='altRelayFunction'
-                name='altRelayFunction'
-                className='select select-bordered w-full'
-                value={formData.altRelayFunction !== undefined ? formData.altRelayFunction : 1}
-                onChange={onChange('altRelayFunction')}
-              >
-                <option value={0}>None</option>
-                <option value={1}>Grind</option>
-                <option value={2} disabled className='text-gray-400'>
-                  Steam Boiler (Coming Soon)
-                </option>
-              </select>
-            </div>
-          </Card>
-
-          <Card sm={10} lg={5} title='Display settings'>
-            <div className='form-control'>
-              <label htmlFor='mainBrightness' className='mb-2 block text-sm font-medium'>
-                Main Brightness (1-16)
-              </label>
-              <input
-                id='mainBrightness'
-                name='mainBrightness'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='16'
-                min='1'
-                max='16'
-                value={formData.mainBrightness}
-                onChange={onChange('mainBrightness')}
-              />
-            </div>
-
-            <div className='divider'>Standby Display</div>
-            <div className='form-control'>
-              <label className='label cursor-pointer'>
-                <span className='label-text'>Enable standby display</span>
-                <input
-                  id='standbyDisplayEnabled'
-                  name='standbyDisplayEnabled'
-                  value='standbyDisplayEnabled'
-                  type='checkbox'
-                  className='toggle toggle-primary'
-                  checked={formData.standbyDisplayEnabled}
-                  onChange={onChange('standbyDisplayEnabled')}
-                />
-              </label>
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='standbyBrightness' className='mb-2 block text-sm font-medium'>
-                Standby Brightness (0-16)
-              </label>
-              <input
-                id='standbyBrightness'
-                name='standbyBrightness'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='8'
-                min='0'
-                max='16'
-                value={formData.standbyBrightness}
-                onChange={onChange('standbyBrightness')}
-                disabled={!formData.standbyDisplayEnabled}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='standbyBrightnessTimeout' className='mb-2 block text-sm font-medium'>
-                Standby Brightness Timeout (seconds)
-              </label>
-              <input
-                id='standbyBrightnessTimeout'
-                name='standbyBrightnessTimeout'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='60'
-                min='1'
-                value={formData.standbyBrightnessTimeout}
-                onChange={onChange('standbyBrightnessTimeout')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='themeMode' className='mb-2 block text-sm font-medium'>
-                Theme
-              </label>
-              <select
-                id='themeMode'
-                name='themeMode'
-                className='select select-bordered w-full'
-                value={formData.themeMode}
-                onChange={onChange('themeMode')}
-              >
-                <option value={0}>Dark Theme</option>
-                <option value={1}>Light Theme</option>
-              </select>
-            </div>
-          </Card>
-
-          {ledControl.value && (
-            <Card sm={10} lg={5} title='Sunrise Settings'>
-              <div className='mb-2 text-sm opacity-70'>
-                Set the colors for the LEDs when in idle mode with no warnings.
-              </div>
-
-              <div className='grid grid-cols-2 gap-4'>
-                <div className='form-control'>
-                  <label htmlFor='sunriseR' className='mb-2 block text-sm font-medium'>
-                    Red (0 - 255)
-                  </label>
-                  <input
-                    id='sunriseR'
-                    name='sunriseR'
-                    type='number'
-                    className='input input-bordered w-full'
-                    placeholder='16'
-                    min='0'
-                    max='255'
-                    value={formData.sunriseR}
-                    onChange={onChange('sunriseR')}
-                  />
-                </div>
-                <div className='form-control'>
-                  <label htmlFor='sunriseG' className='mb-2 block text-sm font-medium'>
-                    Green (0 - 255)
-                  </label>
-                  <input
-                    id='sunriseG'
-                    name='sunriseG'
-                    type='number'
-                    className='input input-bordered w-full'
-                    placeholder='16'
-                    min='0'
-                    max='255'
-                    value={formData.sunriseG}
-                    onChange={onChange('sunriseG')}
-                  />
-                </div>
-              </div>
-
-              <div className='grid grid-cols-2 gap-4'>
-                <div className='form-control'>
-                  <label htmlFor='sunriseB' className='mb-2 block text-sm font-medium'>
-                    Blue (0 - 255)
-                  </label>
-                  <input
-                    id='sunriseB'
-                    name='sunriseB'
-                    type='number'
-                    className='input input-bordered w-full'
-                    placeholder='16'
-                    min='0'
-                    max='255'
-                    value={formData.sunriseB}
-                    onChange={onChange('sunriseB')}
-                  />
-                </div>
-                <div className='form-control'>
-                  <label htmlFor='sunriseW' className='mb-2 block text-sm font-medium'>
-                    White (0 - 255)
-                  </label>
-                  <input
-                    id='sunriseW'
-                    name='sunriseW'
-                    type='number'
-                    className='input input-bordered w-full'
-                    placeholder='16'
-                    min='0'
-                    max='255'
-                    value={formData.sunriseW}
-                    onChange={onChange('sunriseW')}
-                  />
-                </div>
-              </div>
-
-              <div className='form-control'>
-                <label htmlFor='sunriseExtBrightness' className='mb-2 block text-sm font-medium'>
-                  External LED (0 - 255)
-                </label>
-                <input
-                  id='sunriseExtBrightness'
-                  name='sunriseExtBrightness'
-                  type='number'
-                  className='input input-bordered w-full'
-                  placeholder='16'
-                  min='0'
-                  max='255'
-                  value={formData.sunriseExtBrightness}
-                  onChange={onChange('sunriseExtBrightness')}
-                />
-              </div>
-
-              <div className='form-control'>
-                <label htmlFor='emptyTankDistance' className='mb-2 block text-sm font-medium'>
-                  Distance from sensor to bottom of the tank
-                </label>
-                <input
-                  id='emptyTankDistance'
-                  name='emptyTankDistance'
-                  type='number'
-                  className='input input-bordered w-full'
-                  placeholder='16'
-                  min='0'
-                  max='1000'
-                  value={formData.emptyTankDistance}
-                  onChange={onChange('emptyTankDistance')}
-                />
-              </div>
-
-              <div className='form-control'>
-                <label htmlFor='fullTankDistance' className='mb-2 block text-sm font-medium'>
-                  Distance from sensor to the fill line
-                </label>
-                <input
-                  id='fullTankDistance'
-                  name='fullTankDistance'
-                  type='number'
-                  className='input input-bordered w-full'
-                  placeholder='16'
-                  min='0'
-                  max='1000'
-                  value={formData.fullTankDistance}
-                  onChange={onChange('fullTankDistance')}
-                />
-              </div>
-            </Card>
-          )}
-
-          <Card sm={10} title='Plugins'>
-            <PluginCard
+      <form
+        id='settings-page-form'
+        key='settings'
+        ref={formRef}
+        method='post'
+        action='/api/settings'
+        onSubmit={onSubmit}
+        className={isFormTab ? '' : 'hidden'}
+      >
+        {tab === 'general' &&
+          (isLoading ? (
+            <GeneralTabSkeleton />
+          ) : (
+            <GeneralTab
+              formData={formData}
+              onChange={onChange}
+              profiles={profiles}
+              currentTheme={currentTheme}
+              setCurrentTheme={setCurrentTheme}
+              handleThemeChange={handleThemeChange}
+              showWifiPassword={showWifiPassword}
+              setShowWifiPassword={setShowWifiPassword}
+              showApPassword={showApPassword}
+              setShowApPassword={setShowApPassword}
+            />
+          ))}
+        {tab === 'machine' &&
+          (isLoading ? (
+            <MachineTabSkeleton />
+          ) : (
+            <LazyMachineTab formData={formData} onChange={onChange} setField={setField} />
+          ))}
+        {tab === 'plugins' &&
+          (isLoading ? (
+            <PluginsTabSkeleton />
+          ) : (
+            <LazyPluginsTab
               formData={formData}
               onChange={onChange}
               autowakeupSchedules={autowakeupSchedules}
@@ -935,34 +490,16 @@ export function Settings() {
               updateAutoWakeupTime={updateAutoWakeupTime}
               updateAutoWakeupDay={updateAutoWakeupDay}
             />
-          </Card>
-        </div>
+          ))}
 
-        <div className='pt-4 lg:col-span-10'>
-          <div className='alert alert-warning'>
-            <span>Some options like WiFi, NTP and managing Plugins require a restart.</span>
-          </div>
-
-          <div className='flex flex-col gap-2 pt-4 sm:flex-row'>
-            <a href='/' className='btn btn-outline'>
-              Back
-            </a>
-            <button type='submit' className='btn btn-primary' disabled={submitting}>
-              {submitting && <Spinner size={4} />}
-              Save
-            </button>
-            <button
-              type='submit'
-              name='restart'
-              className='btn btn-secondary'
-              disabled={submitting}
-              onClick={e => onSubmit(e, true)}
-            >
-              Save and Restart
-            </button>
-          </div>
-        </div>
+        {isFormTab && (
+          <StickyFormFooter submitting={submitting} onRestart={e => onSubmit(e, true)} />
+        )}
       </form>
-    </>
+
+      {tab === 'calibration' && <LazyCalibrationTab formData={formData} onChange={onChange} />}
+      {tab === 'bluetooth' && (isLoading ? <BluetoothTabSkeleton /> : <LazyBluetoothTab />)}
+      {tab === 'system' && (isLoading ? <SystemTabSkeleton /> : <LazySystemTab />)}
+    </PageLayout>
   );
 }

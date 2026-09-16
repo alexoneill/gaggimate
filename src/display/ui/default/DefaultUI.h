@@ -1,13 +1,15 @@
 #ifndef DEFAULTUI_H
 #define DEFAULTUI_H
 
+#include <atomic>
 #include <display/core/PluginManager.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/constants.h>
 #include <display/drivers/Driver.h>
 #include <display/models/profile.h>
-
-#include "./lvgl/ui.h"
+#include <display/ui/default/eez/screens.h>
+#include <display/ui/default/eez/structs.h>
+#include <mutex>
 
 class Controller;
 
@@ -15,7 +17,6 @@ constexpr int RERENDER_INTERVAL_IDLE = 2500;
 constexpr int RERENDER_INTERVAL_ACTIVE = 100;
 
 constexpr int TEMP_HISTORY_INTERVAL = 250;
-constexpr int TEMP_HISTORY_LENGTH = 20 * 1000 / TEMP_HISTORY_INTERVAL;
 
 int16_t calculate_angle(int set_temp, int range, int offset);
 
@@ -31,7 +32,7 @@ class DefaultUI {
     void loopProfiles();
 
     // Interface methods
-    void changeScreen(lv_obj_t **screen, void (*target_init)(void));
+    void changeScreen(ScreensEnum screen);
 
     void changeBrewScreenMode(BrewScreenState state);
     void onProfileSwitch();
@@ -44,34 +45,56 @@ class DefaultUI {
         }
     };
 
+    void onVolumetricDelete();
+    // Flush started from the touch start button; loop() releases it once the pointer lifts (GM-201).
+    void onTouchFlushStart() { touchFlushHeld = true; }
+
+    // Brew confirmation overlay, shown when the controller asks to confirm a brew start.
+    void setBrewConfirmVisible(bool visible) {
+        brewConfirmVisible = visible;
+        rerender = true;
+    }
+
     void markDirty() { rerender = true; }
+    void markProfileDirty() { profileDirty = true; }
+    void markProfileClean() { profileDirty = false; }
 
     void applyTheme();
+
+    bool isTaskHealthy() const {
+        return is_task_healthy(eTaskGetState(taskHandle)) && is_task_healthy(eTaskGetState(profileTaskHandle));
+    }
 
   private:
     void setupPanel();
     void setupState();
-    void setupReactive();
 
     void handleScreenChange();
 
-    void updateStandbyScreen();
-    void updateStatusScreen() const;
+    // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
+    void animateGaugeTicks(ScreensEnum from, ScreensEnum to);
+    void collectMeters(lv_obj_t *obj);
+    void setGaugeTickLength(int32_t len);
+    static void gaugeTickAnimCb(void *var, int32_t v);
+    lv_obj_t *gaugeMeters[4] = {nullptr};
+    uint8_t gaugeCount = 0;
+    void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
+
+    void updateState();
+    void updateSystemStatus();
+    void updateWarnings();
+    void updateProfileInfo();
+    void updateBoiler();
+    void updateBrewProcess();
+    void updateMenuScreen();
+    String getErrorMessage();
 
     void adjustDials(lv_obj_t *dials);
-    void adjustTempTarget(lv_obj_t *dials);
     void adjustTarget(lv_obj_t *obj, double percentage, double start, double range) const;
 
-    int tempHistory[TEMP_HISTORY_LENGTH] = {0};
-    int tempHistoryIndex = 0;
-    int prevTargetTemp = 0;
-    bool isTempHistoryInitialized = false;
-    int isTemperatureStable = false;
     unsigned long lastTempLog = 0;
-
-    void updateTempHistory();
-    void updateTempStableFlag();
-    void adjustHeatingIndicator(lv_obj_t *contentPanel);
+    int heatingFlashTick = 0;
+    void reloadProfiles();
 
     Driver *panelDriver = nullptr;
     Controller *controller;
@@ -79,52 +102,55 @@ class DefaultUI {
     ProfileManager *profileManager;
 
     // Screen state
-    String selectedProfileId = "";
-    Profile selectedProfile{};
     int updateAvailable = false;
-    int updateActive = false;
     int apActive = false;
-    int error = false;
-    int autotuning = false;
-    int volumetricAvailable = false;
-    int bluetoothScales = false;
-    int volumetricMode = false;
-    int grindActive = false;
-    int active = false;
-    int smartGrindActive = false;
+    int wifiConnected = false;
+    int waitingForController = false;
+    int initialized = false;
     int grindAvailable = false;
 
     // Seasonal flags
     int christmasMode = false;
 
     bool rerender = false;
+    bool touchFlushHeld = false;
     unsigned long lastRender = 0;
 
     int mode = MODE_STANDBY;
-    int currentTemp = 0;
-    int targetTemp = 0;
-    float targetDuration = 0;
-    float targetVolume = 0;
-    int grindDuration = 0;
-    float grindVolume = 0.0f;
-    int pressureAvailable = 0;
-    float pressure = 0.0f;
-    int pressureScaling = DEFAULT_PRESSURE_SCALING;
+    bool pressureAvailable = false;
     int heatingFlash = 0;
+    float pressure = 0.0f;
+    float currentTemp = 0.0f;
+    float targetTemp = 0.0f;
     double bluetoothWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 
-    int currentProfileIdx;
-    String currentProfileId = "";
-    int profileLoaded = 0;
-    Profile currentProfileChoice{};
-    std::vector<String> favoritedProfiles;
+    // EEZ Structs
+    SystemStatusValue systemStatus;
+    ProfileInfoValue selectedProfileInfo;
+    ProfileInfoValue previewProfileInfo;
+    BoilerValue boiler;
+    UIFlagsValue uiFlags;
+    BrewProcessValue brewProcess;
+    WarningsValue warnings;
+    bool brewConfirmVisible = false;
+    Value currentWeight = FloatValue(0.0);
+    Value steamReady = BooleanValue(false);
+    Value grindWeightTarget = FloatValue(18.0);
+    Value grindTimeTarget = StringValue("0:15");
+
+    int profileDirty = 0;
+    int currentProfileIdx = 0;
+    std::atomic<int> profileLoaded{0}; // cleared from event callbacks on arbitrary tasks
+    // The profile task (core 0) rebuilds these while the UI task reads them (GM-147).
+    std::mutex profilesMutex;
+    std::vector<String> favoritedProfileIds;
+    std::vector<Profile> favoritedProfiles;
     int currentThemeMode = -1; // Force applyTheme on first loop
 
     // Screen change
-    lv_obj_t **targetScreen = &ui_InitScreen;
-    lv_obj_t *currentScreen = ui_InitScreen;
-    void (*targetScreenInit)(void) = &ui_InitScreen_screen_init;
+    ScreensEnum targetScreen = ScreensEnum::SCREEN_ID_STANDBY_SCREEN;
+    ScreensEnum currentScreen = ScreensEnum::SCREEN_ID_STANDBY_SCREEN;
 
     // Standby brightness control
     unsigned long standbyEnterTime = 0;
